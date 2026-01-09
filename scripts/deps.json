@@ -1,0 +1,20 @@
+{
+  "linux": [
+    {
+      "Name": "liboo2corelinux64.so.9",
+      "Path": "Engine/Source/Programs/Shared/EpicGames.Oodle/Sdk/2.9.10/linux/lib/liboo2corelinux64.so.9",
+      "Url": "https://cdn.unrealengine.com/dependencies/UnrealEngine-25357016/995e45d0c19f9879aabea9ff1f29e0b340bc2055",
+      "Size": 685360,
+      "PackOffset": 1167730
+    }
+  ],
+  "windows": [
+    {
+      "Name": "oo2core_9_win64.dll",
+      "Path": "Engine/Source/Programs/Shared/EpicGames.Oodle/Sdk/2.9.10/win/redist/oo2core_9_win64.dll",
+      "Url": "https://cdn.unrealengine.com/dependencies/UnrealEngine-27563807/51bf6515dd35ac8361c9a324b6deb1736a61240c",
+      "Size": 637952,
+      "PackOffset": 1240856
+    }
+  ]
+}
