@@ -1,10 +1,17 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <AssemblyName>cue4mcp</AssemblyName>
+    <RootNamespace>CUE4Mcp</RootNamespace>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol" Version="0.5.0-preview.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.1" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\lib\CUE4Parse\CUE4Parse\CUE4Parse.csproj" />
@@ -16,5 +23,18 @@
       <Link>%(Filename)%(Extension)</Link>
       <Visible>false</Visible>
     </None>
+    <EmbeddedResource Include="**\*.md">
+      <Link>%(Filename)%(Extension)</Link>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Domain\Models\" />
   </ItemGroup>
 </Project>
