@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "CUE4Mcp": {
+      "commandName": "Project"
+    },
+    "ToolCall": {
+      "commandName": "Project",
+      "commandLineArgs": "--tool cue4-list-files"
+    }
+  }
+}

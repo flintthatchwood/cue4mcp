@@ -1,5 +1,16 @@
 <Solution>
+  <Folder Name="/lib/">
+    <Project Path="lib/CUE4Parse/CUE4Parse/CUE4Parse.csproj" />
+  </Folder>
+  <Folder Name="/Solution Items/">
+    <File Path=".gitignore" />
+    <File Path="LICENSE" />
+    <File Path="README.md" />
+  </Folder>
   <Folder Name="/src/">
-    <Project Path="src/cue4mcp.csproj" />
+    <Project Path="src/cue4mcp.csproj" DisplayName="CUE4Mcp" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/cue4mcp.FunctionalTests/cue4mcp.FunctionalTests.csproj" Id="5b85f8b5-5966-4680-8f83-e333699acaab" />
   </Folder>
 </Solution>

@@ -39,6 +39,24 @@ if ($Version) {
     $buildArgs += "--property:Version=$Version"
 }
 
+$normalizedOutputDir = $OutputDirectory.Replace('\', '/')
+Write-Host "Closing cue4mcp processes run from $normalizedOutputDir"
+
+$processes = Get-Process | Where-Object { $_.ProcessName -like "*cue4mcp*" -and $_.Path.Replace('\', '/').StartsWith($normalizedOutputDir, 'OrdinalIgnoreCase') } | Select-Object Id, ProcessName, Path
+if ($processes) {
+    foreach ($proc in $processes) {
+        Write-Host " - Id: $($proc.Id), Name: $($proc.ProcessName)"
+    }
+    
+    $processes | Stop-Process -Force
+    Start-Sleep -Seconds 2
+}
+
+if (Test-Path $OutputDirectory) {
+    Write-Host "Deleting existing output directory: $normalizedOutputDir"
+    Remove-Item $OutputDirectory -Recurse -Force -ErrorAction Continue
+}
+
 Write-Host "> dotnet publish $($buildArgs -join ' ')"
 dotnet publish @buildArgs
 
