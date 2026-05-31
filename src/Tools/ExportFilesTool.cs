@@ -1,127 +1,51 @@
 using System.ComponentModel;
-using System.IO;
-using System.Text.RegularExpressions;
 
-using CUE4Mcp.GameFiles;
-
-using CUE4Parse.FileProvider;
-using CUE4Parse.UE4.Assets;
+using CUE4Mcp.Domain;
 
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 using ModelContextProtocol.Server;
-
-using Newtonsoft.Json;
-using Newtonsoft.Json.Serialization;
 
 namespace CUE4Mcp.Tools;
 
 [McpServerToolType]
 public class ExportFilesTool
 {
-    private readonly IFileProvider _fileProvider;
+    private readonly FileService _fileService;
     private readonly ILogger<ExportFilesTool> _logger;
-    private readonly string _outputDirectory;
 
-    public ExportFilesTool(ILogger<ExportFilesTool> logger, IFileProvider fileProvider, IOptions<FileProviderOptions> options)
+    public ExportFilesTool(ILogger<ExportFilesTool> logger, FileService fileService)
     {
-        _fileProvider = fileProvider;
+        _fileService = fileService;
         _logger = logger;
-        _outputDirectory = options.Value.OutputDirectory.Replace(@"\", "/");
     }
 
-    [McpServerTool(Name = "cue4-export-files")]
-    [Description("Export multiple files including all exports and their properties to disk as JSON. Writes to OutputDirectory/{filePath}.json.")]
-    public async Task<object> ExportFiles(
-        [Description("Regex filter for files to process (e.g., '.*Cosmetics.*Character.*'). Must use Linux-style path separators (/) in patterns.")]
-        string filter)
+    [McpServerTool(Name = "cue4-export-packages")]
+    [Description("Export multiple packages including all exports and their properties to disk as JSON. Writes to OutputDirectory/{packageName}.json.")]
+    public async Task<object> ExportPackages(
+        [Description("Regex pattern to match package names (e.g., '.*Maps.*', 'Game/Characters/.*'). Matches against package names, not file paths.")]
+        string pattern)
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(filter))
-            {
-                return new { error = "Path filter is required", code = -32602 };
-            }
-
-            _logger.LogInformation("Exporting files to disk: {Filter}", filter);
-
-            var matchingFiles = _fileProvider.Files.Keys
-                .Where(path => Regex.IsMatch(path, filter, RegexOptions.IgnoreCase))
-                .ToArray();
-
-            var exportedFiles = new List<string>();
-
-            foreach(var file in matchingFiles.AsParallel())
-            {
-                exportedFiles.Add(await ExportFileAsync(file));
-            }
+            var exportedFiles = await _fileService.ExportPackagesToDiskAsync(pattern);
 
             return new
             {
                 success = true,
-                message = $"Exported {exportedFiles.Count} files",
+                message = $"Exported {exportedFiles.Count} packages",
                 filePaths = exportedFiles.Count < 10 ? exportedFiles : null,
             };
         }
+        catch (ArgumentException ex)
+        {
+            _logger.LogWarning(ex, "Invalid argument");
+            return new { error = ex.Message, code = -32602 };
+        }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error exporting file");
+            _logger.LogError(ex, "Error exporting packages");
             return new { error = ex.Message, stackTrace = ex.StackTrace };
         }
-    }
-
-    private async Task<string> ExportFileAsync(string path)
-    {
-        // Sanitize the path for use as a filename (path already uses forward slashes from file provider)
-        var sanitizedPath = Regex.Replace(path, @"[^\w-\./]", "_");
-        var outputPath = Path.Combine(_outputDirectory, Path.ChangeExtension(sanitizedPath, ".json"));
-
-        if (File.Exists(outputPath))
-        {
-            _logger.LogInformation("File already exported, skipping: {Path}", outputPath);
-            return outputPath;
-        }
-
-        // Try to load the package
-        IPackage? package;
-        try
-        {
-            package = _fileProvider.LoadPackage(path);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to load package: {Path}", path);
-            throw new Exception($"Failed to load package: {ex.Message}");
-        }
-
-        if (package == null)
-        {
-            throw new Exception($"Package not found: {path}");
-        }
-
-        // Ensure output directory exists
-        var parentDirectory = Path.GetDirectoryName(outputPath)!;
-        if (!Directory.Exists(parentDirectory))
-        {
-            Directory.CreateDirectory(parentDirectory);
-        }
-
-        // Build exports list with full export data
-        var exports = package.GetExports().ToArray();
-
-        // Write to file
-        var json = JsonConvert.SerializeObject(new
-        {
-            package.Name,
-            package.Summary,
-            Exports = exports
-        }, Formatting.Indented);
-
-        await File.WriteAllTextAsync(outputPath, json);
-
-        _logger.LogInformation("Successfully exported file {Path} with {ExportCount} exports to {OutputPath}", path, exports.Length, outputPath);
-
-        return outputPath;
     }
 }
