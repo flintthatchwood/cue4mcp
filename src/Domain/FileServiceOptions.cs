@@ -1,6 +1,6 @@
-namespace CUE4Mcp.GameFiles;
+namespace CUE4Mcp.Domain;
 
-public class FileProviderOptions
+public class FileServiceOptions
 {
     public string Directory { get; set; } = string.Empty;
     public string Game { get; set; } = "UE5_3";

@@ -1,7 +1,7 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using CUE4Mcp.GameFiles;
+using CUE4Mcp.Domain;
 using Microsoft.Extensions.Configuration;
 
 namespace CUE4Mcp;
@@ -14,9 +14,10 @@ internal class Program
 
         // Add development configuration
         builder.Logging.AddConsole(consoleLogOptions => consoleLogOptions.LogToStandardErrorThreshold = LogLevel.Trace);
-        builder.Services.Configure<FileProviderOptions>(builder.Configuration.GetSection("FileProvider"));
-        builder.Services.AddSingleton<FileProviderService>();
-        builder.Services.AddSingleton(sp => sp.GetRequiredService<FileProviderService>().GetFileProvider());
+        builder.Services.Configure<FileServiceOptions>(builder.Configuration.GetSection("FileProvider"));
+
+        // Register FileService as singleton
+        builder.Services.AddSingleton<FileService>();
 
         builder.Services
             .AddMcpServer()
@@ -26,9 +27,9 @@ internal class Program
 
         var host = builder.Build();
 
-        var fileProviderService = host.Services.GetRequiredService<FileProviderService>();
-
-        await fileProviderService.InitializeAsync();
+        // Initialize FileService
+        var fileService = host.Services.GetRequiredService<FileService>();
+        await fileService.InitializeAsync();
         
         await host.RunAsync();
     }
