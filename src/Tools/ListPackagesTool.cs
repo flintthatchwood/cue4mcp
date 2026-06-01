@@ -32,20 +32,20 @@ public class ListPackagesTool
         try
         {
             // Get filtered packages from domain service
-            var allPackages = _fileService.ListPackages(string.IsNullOrWhiteSpace(pattern) ? null : pattern).ToArray();
-            
+            string[] allPackages = _fileService.ListPackages(string.IsNullOrWhiteSpace(pattern) ? null : pattern).ToArray();
+
             // Parse cursor (skip position)
             int skip = Cursor.Parse(cursor);
 
             // Apply pagination
-            var pagedPackages = allPackages.Skip(skip).Take(PageSize).ToArray();
-            var nextSkip = skip + PageSize;
+            string[] pagedPackages = allPackages.Skip(skip).Take(PageSize).ToArray();
+            int nextSkip = skip + PageSize;
 
-            _logger.LogInformation("Returning {Count} packages starting at {Skip} (total: {Total})", 
+            _logger.LogInformation("Returning {Count} packages starting at {Skip} (total: {Total})",
                 pagedPackages.Length, skip, allPackages.Length);
 
             // Build response with counts and continuation token
-            var response = new Dictionary<string, object>
+            Dictionary<string, object> response = new()
             {
                 ["success"] = true,
                 ["totalPackageCount"] = allPackages.Length,

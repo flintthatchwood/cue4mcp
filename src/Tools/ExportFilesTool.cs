@@ -28,7 +28,7 @@ public class ExportFilesTool
     {
         try
         {
-            var exportedFiles = await _fileService.ExportPackagesToDiskAsync(pattern);
+            IReadOnlyList<string> exportedFiles = await _fileService.ExportPackagesToDiskAsync(pattern);
 
             return new
             {

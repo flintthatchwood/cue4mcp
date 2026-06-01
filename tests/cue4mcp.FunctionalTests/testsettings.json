@@ -1,0 +1,8 @@
+{
+  "FileProvider": {
+    "Directory": "/home/hallipr/runner/live/game/ShooterGame/Content/Paks",
+    "Game": "ARKSurvivalAscended",
+    "SearchOption": "TopDirectoryOnly",
+    "OutputDirectory": "/home/hallipr/cue4mcp/.work/test-output"
+  }
+}

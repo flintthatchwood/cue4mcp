@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using CUE4Parse.Compression;
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
+using CUE4Parse.MappingsProvider;
 using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Assets.Objects.Properties;
@@ -28,11 +29,20 @@ public class FileService
     private readonly ILogger<FileService> _logger;
     private DefaultFileProvider? _fileProvider;
 
+    public DefaultFileProvider Provider
+    {
+        get
+        {
+            EnsureInitialized();
+            return _fileProvider;
+        }
+    }
+
 
     public FileService(ILogger<FileService> logger, IOptions<FileServiceOptions> options)
     {
         _logger = logger;
-        _options = options.Value;        
+        _options = options.Value;
     }
 
     /// <summary>
@@ -40,10 +50,10 @@ public class FileService
     /// </summary>
     public async Task InitializeAsync()
     {
-        var directory = _options.Directory;
-        var gameString = _options.Game;
-        var searchOptionString = _options.SearchOption;
-        var aesKey = _options.AesKey;
+        string directory = _options.Directory;
+        string gameString = _options.Game;
+        string searchOptionString = _options.SearchOption;
+        string? aesKey = _options.AesKey;
 
         if (string.IsNullOrEmpty(directory))
         {
@@ -63,8 +73,8 @@ public class FileService
 
         await InitializeOodleAsync();
 
-        var searchOption = string.IsNullOrEmpty(searchOptionString) 
-            ? SearchOption.TopDirectoryOnly 
+        SearchOption searchOption = string.IsNullOrEmpty(searchOptionString)
+            ? SearchOption.TopDirectoryOnly
             : Enum.Parse<SearchOption>(searchOptionString);
 
         _logger.LogInformation("Creating DefaultFileProvider for {Directory} with {Game}", directory, game);
@@ -75,13 +85,21 @@ public class FileService
             new CUE4Parse.UE4.Versions.VersionContainer(game),
             StringComparer.OrdinalIgnoreCase);
 
+        // Load property mappings if available
+        string? mappingsPath = _options.MappingsPath;
+        if (!string.IsNullOrEmpty(mappingsPath) && File.Exists(mappingsPath))
+        {
+            _logger.LogInformation("Loading mappings from {MappingsPath}", mappingsPath);
+            _fileProvider.MappingsContainer = new FileUsmapTypeMappingsProvider(mappingsPath);
+        }
+
         _fileProvider.Initialize();
 
         if (!string.IsNullOrWhiteSpace(aesKey))
         {
-            var cleanKey = aesKey.Replace("0x", "").Replace("0X", "");
+            string cleanKey = aesKey.Replace("0x", "").Replace("0X", "");
             _fileProvider.SubmitKey(
-                new CUE4Parse.UE4.Objects.Core.Misc.FGuid(), 
+                new CUE4Parse.UE4.Objects.Core.Misc.FGuid(),
                 new CUE4Parse.Encryption.Aes.FAesKey(cleanKey));
             _logger.LogInformation("AES key submitted");
         }
@@ -101,13 +119,13 @@ public class FileService
 
         // Get all package names from loaded packages
         // We need to load each file to get its package name since file paths differ from package names
-        var packageNames = _fileProvider.Files.Keys
+        IEnumerable<string> packageNames = _fileProvider.Files.Keys
             .Where(IsPackageFile) // Only include .uasset, .umap files
             .Select(filePath =>
             {
                 try
                 {
-                    var package = _fileProvider.LoadPackage(filePath);
+                    IPackage package = _fileProvider.LoadPackage(filePath);
                     return package?.Name;
                 }
                 catch
@@ -121,7 +139,7 @@ public class FileService
 
         if (!string.IsNullOrWhiteSpace(pattern))
         {
-            var regex = new Regex(pattern, RegexOptions.IgnoreCase);
+            Regex regex = new(pattern, RegexOptions.IgnoreCase);
             packageNames = packageNames.Where(p => regex.IsMatch(p));
         }
 
@@ -144,7 +162,7 @@ public class FileService
 
         _logger.LogInformation("Loading package: {PackageName}", packageName);
 
-        var package = _fileProvider.LoadPackage(packageName);
+        IPackage package = _fileProvider.LoadPackage(packageName);
         if (package == null)
             throw new InvalidOperationException($"Package not found: {packageName}");
 
@@ -172,15 +190,15 @@ public class FileService
 
         _logger.LogInformation("Loading export {Index} from package: {PackageName}", exportIndex, packageName);
 
-        var package = _fileProvider.LoadPackage(packageName);
+        IPackage package = _fileProvider.LoadPackage(packageName);
         if (package == null)
             throw new InvalidOperationException($"Package not found: {packageName}");
 
-        var exports = package.ExportsLazy;
+        Lazy<UObject>[] exports = package.ExportsLazy;
         if (exportIndex >= exports.Length)
             throw new ArgumentException($"Export index {exportIndex} is out of range. Package has {exports.Length} exports.", nameof(exportIndex));
 
-        var export = exports[exportIndex].Value;
+        UObject export = exports[exportIndex].Value;
 
         _logger.LogInformation("Successfully loaded export {Index} ({Name}) from {PackageName}", exportIndex, export.Name, packageName);
         return export;
@@ -199,22 +217,22 @@ public class FileService
 
         _logger.LogInformation("Exporting packages to disk: {Pattern}", pattern);
 
-        var regex = new Regex(pattern, RegexOptions.IgnoreCase);
-        var exportedFiles = new List<string>();
+        Regex regex = new(pattern, RegexOptions.IgnoreCase);
+        List<string> exportedFiles = new();
 
         // Find matching package files
-        var matchingFiles = _fileProvider.Files.Keys
+        string[] matchingFiles = _fileProvider.Files.Keys
             .Where(IsPackageFile)
             .ToArray();
 
-        foreach (var filePath in matchingFiles)
+        foreach (string? filePath in matchingFiles)
         {
             if (cancellationToken.IsCancellationRequested)
                 break;
 
             try
             {
-                var package = _fileProvider.LoadPackage(filePath);
+                IPackage package = _fileProvider.LoadPackage(filePath);
                 if (package != null && regex.IsMatch(package.Name))
                 {
                     exportedFiles.Add(await ExportPackageAsync(package, filePath));
@@ -245,7 +263,7 @@ public class FileService
             {
                 try
                 {
-                    var package = _fileProvider.LoadPackage(filePath);
+                    IPackage package = _fileProvider.LoadPackage(filePath);
                     return new { FilePath = filePath, PackageName = package?.Name };
                 }
                 catch
@@ -257,16 +275,16 @@ public class FileService
             .Select(p => new { p!.FilePath, p.PackageName })
             .ToArray();
 
-        var outputDirectory = _options.OutputDirectory;
+        string outputDirectory = _options.OutputDirectory;
 
         if (!Directory.Exists(outputDirectory))
         {
             Directory.CreateDirectory(outputDirectory);
         }
 
-        var outputPath = Path.Combine(outputDirectory, "all-packages.json");
+        string outputPath = Path.Combine(outputDirectory, "all-packages.json");
 
-        var json = JsonConvert.SerializeObject(new
+        string json = JsonConvert.SerializeObject(new
         {
             success = true,
             totalPackageCount = packageNames.Length,
@@ -310,24 +328,24 @@ public class FileService
                 : new Regex(pattern, RegexOptions.IgnoreCase);
         }
 
-        var keyRegex = CompilePattern(keyPattern);
-        var valueRegex = CompilePattern(valuePattern);
-        var packageRegex = CompilePattern(packagePattern);
+        Regex? keyRegex = CompilePattern(keyPattern);
+        Regex? valueRegex = CompilePattern(valuePattern);
+        Regex? packageRegex = CompilePattern(packagePattern);
 
         _logger.LogInformation("Searching exports - Key: {KeyPattern}, Value: {ValuePattern}, Packages: {PackagePattern}",
             keyPattern ?? "(none)", valuePattern ?? "(none)", packagePattern ?? "(all)");
 
         // Search through package files
-        var filesToSearch = _fileProvider.Files.Keys
+        string[] filesToSearch = _fileProvider.Files.Keys
             .Where(IsPackageFile)
             .ToArray();
 
-        for (var i = 0; i < filesToSearch.Length; i++)
+        for (int i = 0; i < filesToSearch.Length; i++)
         {
-            var filePath = filesToSearch[i];
+            string filePath = filesToSearch[i];
             _logger.LogInformation("Searching file {FileName}", filePath);
 
-            if (!_fileProvider.TryLoadPackage(filePath, out var package))
+            if (!_fileProvider.TryLoadPackage(filePath, out IPackage? package))
             {
                 _logger.LogDebug("Failed to load package from file: {FilePath}", filePath);
                 continue;
@@ -337,7 +355,7 @@ public class FileService
             if (packageRegex != null && !packageRegex.IsMatch(package.Name))
                 continue;
 
-            var exports = package.ExportsLazy;
+            Lazy<UObject>[] exports = package.ExportsLazy;
             for (int j = 0; j < exports.Length; j++)
             {
                 UObject export;
@@ -351,9 +369,9 @@ public class FileService
                     continue;
                 }
 
-                var exportMatches = SearchExport(export, keyRegex, valueRegex, searchType);
+                List<ExportSearchResult> exportMatches = SearchExport(export, keyRegex, valueRegex, searchType);
 
-                foreach (var match in exportMatches)
+                foreach (ExportSearchResult match in exportMatches)
                 {
                     yield return new SearchResult(package, export, j, match.SearchType, match.MatchType, match.MatchedName, match.MatchedValue);
                 }
@@ -377,7 +395,7 @@ public class FileService
         // Only consider .uasset and .umap files as packages
         // .uexp, .ubulk, etc. are supporting files
 
-        foreach (var extension in GameFile.UePackageExtensions)
+        foreach (string extension in GameFile.UePackageExtensions)
         {
             if (filePath.EndsWith($".{extension}", StringComparison.OrdinalIgnoreCase))
                 return true;
@@ -388,14 +406,14 @@ public class FileService
 
     private async Task InitializeOodleAsync()
     {
-        var nativeOodleFilename = Environment.OSVersion.Platform switch
+        string nativeOodleFilename = Environment.OSVersion.Platform switch
         {
             PlatformID.Win32NT => "oo2core_9_win64.dll",
             PlatformID.Unix => "liboo2corelinux64.so.9",
             _ => throw new PlatformNotSupportedException("Unsupported OS for Oodle"),
         };
 
-        var oodleLocation = Path.Join(AppContext.BaseDirectory, nativeOodleFilename);
+        string oodleLocation = Path.Join(AppContext.BaseDirectory, nativeOodleFilename);
         _logger.LogInformation("Initializing Oodle from {OodleLocation}", oodleLocation);
 
         if (!File.Exists(oodleLocation))
@@ -408,10 +426,10 @@ public class FileService
 
     private async Task<string> ExportPackageAsync(IPackage package, string filePath)
     {
-        var outputDirectory = _options.OutputDirectory;
+        string outputDirectory = _options.OutputDirectory;
         // Use package name for output path structure
-        var sanitizedPath = Regex.Replace(package.Name, @"[^\w-\./]", "_").TrimStart('/');
-        var outputPath = Path.Combine(outputDirectory, Path.ChangeExtension(sanitizedPath, ".json"));
+        string sanitizedPath = Regex.Replace(package.Name, @"[^\w-\./]", "_").TrimStart('/');
+        string outputPath = Path.Combine(outputDirectory, Path.ChangeExtension(sanitizedPath, ".json"));
 
         if (File.Exists(outputPath))
         {
@@ -419,15 +437,15 @@ public class FileService
             return outputPath;
         }
 
-        var parentDirectory = Path.GetDirectoryName(outputPath)!;
+        string parentDirectory = Path.GetDirectoryName(outputPath)!;
         if (!Directory.Exists(parentDirectory))
         {
             Directory.CreateDirectory(parentDirectory);
         }
 
-        var exports = package.GetExports().ToArray();
+        UObject[] exports = package.GetExports().ToArray();
 
-        var json = JsonConvert.SerializeObject(new
+        string json = JsonConvert.SerializeObject(new
         {
             packageName = package.Name,
             filePath = filePath,
@@ -445,22 +463,22 @@ public class FileService
 
     private List<ExportSearchResult> SearchExport(UObject export, Regex? keyRegex, Regex? valueRegex, ExportSearchType searchType)
     {
-        var matches = new List<ExportSearchResult>();
-        var hasProperties = export.Properties?.Count > 0;
+        List<ExportSearchResult> matches = new();
+        bool hasProperties = export.Properties?.Count > 0;
 
         if (searchType == ExportSearchType.Property && !hasProperties)
             return matches;
 
-        var serialized = JObject.FromObject(export, Json.DefaultSerializer);
+        JObject serialized = JObject.FromObject(export, Json.DefaultSerializer);
 
         if (searchType.HasFlag(ExportSearchType.Field))
         {
-            foreach (var property in serialized.Properties())
+            foreach (JProperty property in serialized.Properties())
             {
-                var key = property.Name;
-                var value = property.Value.ToString(Formatting.None);
+                string key = property.Name;
+                string value = property.Value.ToString(Formatting.None);
 
-                var matchType = ExportMatchType.None;
+                ExportMatchType matchType = ExportMatchType.None;
                 if (keyRegex != null && keyRegex.IsMatch(key))
                 {
                     matchType |= ExportMatchType.Key;
@@ -481,11 +499,11 @@ public class FileService
 
         if (searchType.HasFlag(ExportSearchType.Property) && hasProperties)
         {
-            foreach (var property in serialized.Value<JObject>("Properties")!.Properties())
+            foreach (JProperty property in serialized.Value<JObject>("Properties")!.Properties())
             {
-                var matchType = ExportMatchType.None;
-                var key = property.Name;
-                var value = property.Value.ToString(Formatting.None);
+                ExportMatchType matchType = ExportMatchType.None;
+                string key = property.Name;
+                string value = property.Value.ToString(Formatting.None);
 
                 if (keyRegex != null && keyRegex.IsMatch(key))
                 {

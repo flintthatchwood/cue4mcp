@@ -9,8 +9,8 @@ public static class Cursor
 
         try
         {
-            var cursorBytes = Convert.FromBase64String(cursor);
-            var cursorText = System.Text.Encoding.UTF8.GetString(cursorBytes);
+            byte[] cursorBytes = Convert.FromBase64String(cursor);
+            string cursorText = System.Text.Encoding.UTF8.GetString(cursorBytes);
             return int.Parse(cursorText);
         }
         catch (Exception ex)
@@ -21,7 +21,7 @@ public static class Cursor
 
     public static string Encode(int position)
     {
-        var bytes = System.Text.Encoding.UTF8.GetBytes(position.ToString());
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(position.ToString());
         return Convert.ToBase64String(bytes);
     }
 }

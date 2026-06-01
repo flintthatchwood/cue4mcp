@@ -10,7 +10,7 @@ internal class Program
 {
     private static async Task Main(string[] args)
     {
-        var builder = Host.CreateApplicationBuilder(args);
+        HostApplicationBuilder builder = Host.CreateApplicationBuilder(args);
 
         // Add development configuration
         builder.Logging.AddConsole(consoleLogOptions => consoleLogOptions.LogToStandardErrorThreshold = LogLevel.Trace);
@@ -18,6 +18,13 @@ internal class Program
 
         // Register FileService as singleton
         builder.Services.AddSingleton<FileService>();
+        builder.Services.AddSingleton<ExportIndex>(sp =>
+        {
+            ILogger<ExportIndex> logger = sp.GetRequiredService<ILogger<ExportIndex>>();
+            FileServiceOptions options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<FileServiceOptions>>().Value;
+            string cacheDir = Path.Combine(options.OutputDirectory, "cache");
+            return new ExportIndex(logger, cacheDir);
+        });
 
         builder.Services
             .AddMcpServer()
@@ -25,12 +32,16 @@ internal class Program
             .WithToolsFromAssembly()
             .WithResourcesFromAssembly();
 
-        var host = builder.Build();
+        IHost host = builder.Build();
 
         // Initialize FileService
-        var fileService = host.Services.GetRequiredService<FileService>();
+        FileService fileService = host.Services.GetRequiredService<FileService>();
         await fileService.InitializeAsync();
-        
+
+        // Initialize export index (loads from cache or builds from provider)
+        ExportIndex exportIndex = host.Services.GetRequiredService<ExportIndex>();
+        await exportIndex.InitializeAsync(fileService.Provider);
+
         await host.RunAsync();
     }
 }

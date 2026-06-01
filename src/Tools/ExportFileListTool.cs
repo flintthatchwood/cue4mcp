@@ -26,10 +26,10 @@ public class ExportFileListTool
     {
         try
         {
-            var outputPath = await _fileService.ExportPackageListToDiskAsync();
+            string outputPath = await _fileService.ExportPackageListToDiskAsync();
 
             // Count packages from the output to provide summary
-            var allPackages = _fileService.ListPackages().ToArray();
+            string[] allPackages = _fileService.ListPackages().ToArray();
 
             return new
             {

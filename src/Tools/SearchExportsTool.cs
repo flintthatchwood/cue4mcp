@@ -39,20 +39,20 @@ public class SearchExportsTool
         try
         {
             // Validate return level
-            if(!Enum.TryParse<ExportSearchType>(searchType, true, out var exportSearchType))
+            if (!Enum.TryParse<ExportSearchType>(searchType, true, out ExportSearchType exportSearchType))
             {
                 return new { error = "searchType must be 'field', 'property', or 'all'", code = -32602 };
             }
-            
+
             // Parse cursor (file skip position)
             int skip = Cursor.Parse(cursor);
 
-            var stopwatch = Stopwatch.StartNew();
+            Stopwatch stopwatch = Stopwatch.StartNew();
             // Get search results from domain service
-            var searchResults = _fileService.SearchExports(keyPattern, valuePattern, packagePattern, exportSearchType).ToList();
+            List<SearchResult> searchResults = _fileService.SearchExports(keyPattern, valuePattern, packagePattern, exportSearchType).ToList();
 
             // Apply pagination and collect matches
-            var page = searchResults
+            IEnumerable<SearchResult> page = searchResults
                 .Skip(skip)
                 .Take(_maxMatches);
 
@@ -61,14 +61,14 @@ public class SearchExportsTool
                 .ToList();
             stopwatch.Stop();
 
-            var nextSkip = skip + matches.Count;
+            int nextSkip = skip + matches.Count;
 
-            var packageCount = matches.Select(x => x.Package).Distinct();
+            IEnumerable<string> packageCount = matches.Select(x => x.Package).Distinct();
 
             _logger.LogInformation("Found {MatchCount} matches across {PackageCount} packages", matches.Count, packageCount);
 
             // Build response with counts and continuation token
-            var response = new Dictionary<string, object>
+            Dictionary<string, object> response = new()
             {
                 ["searchTime"] = stopwatch.ElapsedMilliseconds,
                 ["matchCount"] = matches.Count,
@@ -76,7 +76,7 @@ public class SearchExportsTool
                 ["matches"] = matches
             };
 
-            var hasMore = nextSkip < searchResults.Count;
+            bool hasMore = nextSkip < searchResults.Count;
             if (hasMore)
             {
                 response["nextCursor"] = Cursor.Encode(nextSkip);
