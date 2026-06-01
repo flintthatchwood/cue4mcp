@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using CUE4Mcp.Domain;
+using CUE4Parse.UE4.Assets.Exports;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
 
@@ -28,7 +29,7 @@ public class GetExportTool
     {
         try
         {
-            var export = _fileService.GetExport(packageName, exportIndex);
+            UObject export = _fileService.GetExport(packageName, exportIndex);
             return JsonConvert.SerializeObject(export, Json.DefaultSerializerSettings);
         }
         catch (ArgumentException ex)

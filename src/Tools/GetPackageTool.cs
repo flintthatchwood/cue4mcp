@@ -1,7 +1,8 @@
 using System.ComponentModel;
 
 using CUE4Mcp.Domain;
-
+using CUE4Parse.UE4.Assets;
+using CUE4Parse.UE4.Assets.Exports;
 using Microsoft.Extensions.Logging;
 
 using ModelContextProtocol.Server;
@@ -28,18 +29,18 @@ public class GetPackageTool
     {
         try
         {
-            var package = _fileService.GetPackage(packageName);
+            IPackage package = _fileService.GetPackage(packageName);
 
             // Build exports list with basic info (not full export data)
-            var exportsList = new List<object?>();
-            var exports = package.ExportsLazy;
-            var index = 0;
-            foreach(var lazyExport in exports)
+            List<object?> exportsList = new();
+            Lazy<UObject>[] exports = package.ExportsLazy;
+            int index = 0;
+            foreach (Lazy<UObject> lazyExport in exports)
             {
                 try
                 {
-                    var export = lazyExport.Value;
-                    if(export == null)
+                    UObject export = lazyExport.Value;
+                    if (export == null)
                     {
                         exportsList.Add(null);
                         continue;
