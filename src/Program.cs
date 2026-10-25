@@ -17,14 +17,14 @@ internal class Program
         builder.Services.Configure<FileServiceOptions>(builder.Configuration.GetSection("FileProvider"));
 
         // Register FileService as singleton
-        builder.Services.AddSingleton<FileService>();
-        builder.Services.AddSingleton<ExportIndex>(sp =>
+        builder.Services.AddSingleton<IExportIndex, ExportIndex>(sp =>
         {
             ILogger<ExportIndex> logger = sp.GetRequiredService<ILogger<ExportIndex>>();
             FileServiceOptions options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<FileServiceOptions>>().Value;
             string cacheDir = Path.Combine(options.OutputDirectory, "cache");
             return new ExportIndex(logger, cacheDir);
         });
+        builder.Services.AddSingleton<FileService>();
 
         builder.Services
             .AddMcpServer()
@@ -39,7 +39,7 @@ internal class Program
         await fileService.InitializeAsync();
 
         // Initialize export index (loads from cache or builds from provider)
-        ExportIndex exportIndex = host.Services.GetRequiredService<ExportIndex>();
+        ExportIndex exportIndex = (ExportIndex)host.Services.GetRequiredService<IExportIndex>();
         await exportIndex.InitializeAsync(fileService.Provider);
 
         await host.RunAsync();

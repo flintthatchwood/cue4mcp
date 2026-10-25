@@ -25,7 +25,7 @@ public class SearchExportsTool
     [McpServerTool(Name = "cue4-search-exports")]
     [Description("Search for exports by key name or property value. Returns matching exports with their package names.")]
     public async Task<object> SearchExports(
-        [Description("Optional regex pattern to match export property key names (e.g., '^PrecomputedVolumeDistanceField$', '^Blueprint.*')")]
+        [Description("Optional regex pattern to match export property key names (e.g., '^PrecomputedVolumeDistanceField$', '^Blueprint.*'). When searchType='property' this is index-accelerated.")]
         string? keyPattern = null,
         [Description("Optional regex pattern to match property values as strings (e.g., '.*BlackPearl.*', '^Weapon_.*')")]
         string? valuePattern = null,
@@ -33,6 +33,14 @@ public class SearchExportsTool
         string? packagePattern = null,
         [Description("Type of search: 'field' (search export fields), 'property' (search export properties), or 'all' (both). Default: 'all'")]
         string searchType = "all",
+        [Description("Optional regex pattern to filter packages by export class name. Uses the index — much faster than a full scan.")]
+        string? classPattern = null,
+        [Description("Optional regex pattern to filter packages by export super (parent) class name. Uses the index — much faster than a full scan.")]
+        string? superPattern = null,
+        [Description("Optional regex pattern to filter packages by export outer name. Uses the index — much faster than a full scan.")]
+        string? outerPattern = null,
+        [Description("Optional regex pattern to filter packages by export template name. Uses the index — much faster than a full scan.")]
+        string? templatePattern = null,
         [Description("Optional cursor for pagination (opaque string)")]
         string? cursor = null)
     {
@@ -49,7 +57,15 @@ public class SearchExportsTool
 
             Stopwatch stopwatch = Stopwatch.StartNew();
             // Get search results from domain service
-            List<SearchResult> searchResults = _fileService.SearchExports(keyPattern, valuePattern, packagePattern, exportSearchType).ToList();
+            List<SearchResult> searchResults = _fileService.SearchExports(
+                packagePattern: packagePattern,
+                keyPattern: keyPattern,
+                valuePattern: valuePattern,
+                searchType: exportSearchType,
+                classPattern: classPattern,
+                superPattern: superPattern,
+                outerPattern: outerPattern,
+                templatePattern: templatePattern).ToList();
 
             // Apply pagination and collect matches
             IEnumerable<SearchResult> page = searchResults

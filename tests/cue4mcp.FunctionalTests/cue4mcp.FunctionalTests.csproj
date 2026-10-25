@@ -20,4 +20,12 @@
     <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="..\..\..\parser\src\ArkParser.Cli\deps\oo2core_9_win64.dll" Condition="Exists('..\..\..\parser\src\ArkParser.Cli\deps\oo2core_9_win64.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>oo2core_9_win64.dll</Link>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
 </Project>

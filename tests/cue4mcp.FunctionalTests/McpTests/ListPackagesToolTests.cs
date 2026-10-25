@@ -8,18 +8,24 @@ namespace cue4mcp.FunctionalTests.McpTests;
 [TestClass]
 public sealed class ListPackagesToolTests
 {
-    private static string ServerPath => Path.Combine(AppContext.BaseDirectory, "cue4mcp");
+    private static string ServerPath =>
+        Environment.OSVersion.Platform == PlatformID.Win32NT
+            ? Path.Combine(AppContext.BaseDirectory, "cue4mcp.exe")
+            : Path.Combine(AppContext.BaseDirectory, "cue4mcp");
 
     private async Task<McpClient> CreateClientAsync()
     {
         TestSettings settings = TestSettings.Instance;
+        using CancellationTokenSource cts = new(TimeSpan.FromMinutes(5));
+
         return await McpClient.CreateAsync(new StdioClientTransport(new StdioClientTransportOptions
         {
             Command = ServerPath,
             Arguments = [$"--FileProvider:Directory={settings.FileProvider.Directory}",
                          $"--FileProvider:Game={settings.FileProvider.Game}",
-                         $"--FileProvider:SearchOption={settings.FileProvider.SearchOption}"]
-        }));
+                         $"--FileProvider:SearchOption={settings.FileProvider.SearchOption}",
+                         $"--FileProvider:OutputDirectory={settings.FileProvider.OutputDirectory}"]
+        }), cancellationToken: cts.Token);
     }
 
     [TestMethod]

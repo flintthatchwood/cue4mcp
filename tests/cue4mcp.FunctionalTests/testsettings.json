@@ -1,8 +1,8 @@
 {
   "FileProvider": {
-    "Directory": "/home/flintthatchwood/runner/live/game/ShooterGame/Content/Paks",
+    "Directory": "D:/ark/runner/live/game/ShooterGame/Content/Paks",
     "Game": "ARKSurvivalAscended",
     "SearchOption": "TopDirectoryOnly",
-    "OutputDirectory": "/home/flintthatchwood/cue4mcp/.work/test-output"
+    "OutputDirectory": "D:/ark/.work"
   }
 }

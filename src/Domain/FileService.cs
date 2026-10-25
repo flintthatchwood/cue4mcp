@@ -27,6 +27,7 @@ public class FileService
 {
     private readonly FileServiceOptions _options;
     private readonly ILogger<FileService> _logger;
+    private readonly IExportIndex _index;
     private DefaultFileProvider? _fileProvider;
 
     public DefaultFileProvider Provider
@@ -38,11 +39,11 @@ public class FileService
         }
     }
 
-
-    public FileService(ILogger<FileService> logger, IOptions<FileServiceOptions> options)
+    public FileService(ILogger<FileService> logger, IOptions<FileServiceOptions> options, IExportIndex index)
     {
         _logger = logger;
         _options = options.Value;
+        _index = index;
     }
 
     /// <summary>
@@ -117,25 +118,7 @@ public class FileService
     {
         EnsureInitialized();
 
-        // Get all package names from loaded packages
-        // We need to load each file to get its package name since file paths differ from package names
-        IEnumerable<string> packageNames = _fileProvider.Files.Keys
-            .Where(IsPackageFile) // Only include .uasset, .umap files
-            .Select(filePath =>
-            {
-                try
-                {
-                    IPackage package = _fileProvider.LoadPackage(filePath);
-                    return package?.Name;
-                }
-                catch
-                {
-                    return null;
-                }
-            })
-            .Where(name => name != null)
-            .Select(name => name!)
-            .Distinct();
+        IEnumerable<string> packageNames = _index.PackagePaths;
 
         if (!string.IsNullOrWhiteSpace(pattern))
         {
@@ -220,27 +203,26 @@ public class FileService
         Regex regex = new(pattern, RegexOptions.IgnoreCase);
         List<string> exportedFiles = new();
 
-        // Find matching package files
-        string[] matchingFiles = _fileProvider.Files.Keys
-            .Where(IsPackageFile)
+        string[] matchingNames = _index.PackagePaths
+            .Where(name => regex.IsMatch(name))
             .ToArray();
 
-        foreach (string? filePath in matchingFiles)
+        foreach (string packageName in matchingNames)
         {
             if (cancellationToken.IsCancellationRequested)
                 break;
 
             try
             {
-                IPackage package = _fileProvider.LoadPackage(filePath);
-                if (package != null && regex.IsMatch(package.Name))
+                IPackage package = _fileProvider.LoadPackage(packageName);
+                if (package != null)
                 {
-                    exportedFiles.Add(await ExportPackageAsync(package, filePath));
+                    exportedFiles.Add(await ExportPackageAsync(package, packageName));
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to export package from file: {FilePath}", filePath);
+                _logger.LogWarning(ex, "Failed to export package: {PackageName}", packageName);
             }
         }
 
@@ -256,24 +238,7 @@ public class FileService
 
         _logger.LogInformation("Exporting complete package list to disk");
 
-        // Get all package names
-        var packageNames = _fileProvider.Files.Keys
-            .Where(IsPackageFile)
-            .Select(filePath =>
-            {
-                try
-                {
-                    IPackage package = _fileProvider.LoadPackage(filePath);
-                    return new { FilePath = filePath, PackageName = package?.Name };
-                }
-                catch
-                {
-                    return null;
-                }
-            })
-            .Where(p => p?.PackageName != null)
-            .Select(p => new { p!.FilePath, p.PackageName })
-            .ToArray();
+        string[] packageNames = _index.PackagePaths.ToArray();
 
         string outputDirectory = _options.OutputDirectory;
 
@@ -289,11 +254,7 @@ public class FileService
             success = true,
             totalPackageCount = packageNames.Length,
             exportedAt = DateTime.UtcNow,
-            packages = packageNames.Select(p => new
-            {
-                packageName = p.PackageName,
-                filePath = p.FilePath
-            }).ToArray()
+            packages = packageNames
         }, Formatting.Indented);
 
         await File.WriteAllTextAsync(outputPath, json, cancellationToken);
@@ -313,7 +274,11 @@ public class FileService
         string? packagePattern = null,
         string? keyPattern = null,
         string? valuePattern = null,
-        ExportSearchType searchType = ExportSearchType.All
+        ExportSearchType searchType = ExportSearchType.All,
+        string? classPattern = null,
+        string? superPattern = null,
+        string? outerPattern = null,
+        string? templatePattern = null
     )
     {
         EnsureInitialized();
@@ -332,51 +297,119 @@ public class FileService
         Regex? valueRegex = CompilePattern(valuePattern);
         Regex? packageRegex = CompilePattern(packagePattern);
 
-        _logger.LogInformation("Searching exports - Key: {KeyPattern}, Value: {ValuePattern}, Packages: {PackagePattern}",
-            keyPattern ?? "(none)", valuePattern ?? "(none)", packagePattern ?? "(all)");
+        _logger.LogInformation(
+            "Searching exports - Key: {KeyPattern}, Value: {ValuePattern}, Package: {PackagePattern}, Class: {ClassPattern}, Super: {SuperPattern}",
+            keyPattern ?? "(none)", valuePattern ?? "(none)", packagePattern ?? "(all)",
+            classPattern ?? "(none)", superPattern ?? "(none)");
 
-        // Search through package files
-        string[] filesToSearch = _fileProvider.Files.Keys
-            .Where(IsPackageFile)
-            .ToArray();
+        // Use index to pre-filter candidate packages when index patterns are provided.
+        // The property-key index is only consulted when the user restricted the search
+        // to Property scope — otherwise a key could match a top-level UObject field
+        // on a package that has no matching property tag, and the index would wrongly
+        // exclude it.
+        string? indexKeyPattern = searchType == ExportSearchType.Property ? keyPattern : null;
+        HashSet<string>? indexCandidates = BuildIndexCandidates(
+            classPattern, superPattern, outerPattern, templatePattern, indexKeyPattern);
 
-        for (int i = 0; i < filesToSearch.Length; i++)
+        if (indexCandidates != null)
         {
-            string filePath = filesToSearch[i];
-            _logger.LogInformation("Searching file {FileName}", filePath);
+            // Fast path: only load packages identified by the index
+            IEnumerable<string> candidates = indexCandidates;
+            if (packageRegex != null)
+                candidates = candidates.Where(name => packageRegex.IsMatch(name));
 
-            if (!_fileProvider.TryLoadPackage(filePath, out IPackage? package))
+            foreach (string packageName in candidates)
             {
-                _logger.LogDebug("Failed to load package from file: {FilePath}", filePath);
-                continue;
-            }
+                IPackage? package;
+                try { package = _fileProvider.LoadPackage(packageName); }
+                catch (Exception ex) { _logger.LogDebug(ex, "Failed to load package: {Name}", packageName); continue; }
+                if (package == null) continue;
 
-            // Filter by package name if pattern provided
-            if (packageRegex != null && !packageRegex.IsMatch(package.Name))
-                continue;
-
-            Lazy<UObject>[] exports = package.ExportsLazy;
-            for (int j = 0; j < exports.Length; j++)
-            {
-                UObject export;
-                try
-                {
-                    export = exports[j].Value;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "Failed to load export {Index} from {PackageName}", j, package.Name);
-                    continue;
-                }
-
-                List<ExportSearchResult> exportMatches = SearchExport(export, keyRegex, valueRegex, searchType);
-
-                foreach (ExportSearchResult match in exportMatches)
-                {
-                    yield return new SearchResult(package, export, j, match.SearchType, match.MatchType, match.MatchedName, match.MatchedValue);
-                }
+                foreach (SearchResult result in SearchPackageExports(package, keyRegex, valueRegex, searchType))
+                    yield return result;
             }
         }
+        else
+        {
+            // Slow path: scan all package files
+            foreach (string filePath in _fileProvider.Files.Keys.Where(IsPackageFile))
+            {
+                if (!_fileProvider.TryLoadPackage(filePath, out IPackage? package))
+                    continue;
+
+                if (packageRegex != null && !packageRegex.IsMatch(package.Name))
+                    continue;
+
+                foreach (SearchResult result in SearchPackageExports(package, keyRegex, valueRegex, searchType))
+                    yield return result;
+            }
+        }
+    }
+
+    private IEnumerable<SearchResult> SearchPackageExports(IPackage package, Regex? keyRegex, Regex? valueRegex, ExportSearchType searchType)
+    {
+        Lazy<UObject>[] exports = package.ExportsLazy;
+        for (int j = 0; j < exports.Length; j++)
+        {
+            UObject export;
+            try { export = exports[j].Value; }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to load export {Index} from {PackageName}", j, package.Name);
+                continue;
+            }
+
+            foreach (ExportSearchResult match in SearchExport(export, keyRegex, valueRegex, searchType))
+                yield return new SearchResult(package, export, j, match.SearchType, match.MatchType, match.MatchedName, match.MatchedValue);
+        }
+    }
+
+    private HashSet<string>? BuildIndexCandidates(
+        string? classPattern,
+        string? superPattern,
+        string? outerPattern,
+        string? templatePattern,
+        string? propertyKeyPattern)
+    {
+        if (classPattern == null && superPattern == null && outerPattern == null
+            && templatePattern == null && propertyKeyPattern == null)
+            return null;
+
+        HashSet<string>? result = null;
+
+        void Intersect(IEnumerable<string> paths)
+        {
+            HashSet<string> set = new(paths, StringComparer.OrdinalIgnoreCase);
+            if (result == null)
+                result = set;
+            else
+                result.IntersectWith(set);
+        }
+
+        if (classPattern != null)
+            Intersect(GetPackagesByIndexPattern(classPattern, _index.GetClassNames(), _index.FindByClass));
+        if (superPattern != null)
+            Intersect(GetPackagesByIndexPattern(superPattern, _index.GetSuperNames(), _index.FindBySuper));
+        if (outerPattern != null)
+            Intersect(GetPackagesByIndexPattern(outerPattern, _index.GetOuterNames(), _index.FindByOuter));
+        if (templatePattern != null)
+            Intersect(GetPackagesByIndexPattern(templatePattern, _index.GetTemplateNames(), _index.FindByTemplate));
+        if (propertyKeyPattern != null)
+            Intersect(GetPackagesByIndexPattern(propertyKeyPattern, _index.GetPropertyKeys(), _index.FindByPropertyKey));
+
+        return result ?? []; // empty set = patterns had no index matches
+    }
+
+    private static IEnumerable<string> GetPackagesByIndexPattern(
+        string pattern,
+        IReadOnlyCollection<string> indexNames,
+        Func<string, IReadOnlyList<ExportRef>> lookup)
+    {
+        Regex regex = new(pattern, RegexOptions.IgnoreCase);
+        return indexNames
+            .Where(n => regex.IsMatch(n))
+            .SelectMany(lookup)
+            .Select(r => r.PackagePath);
     }
 
     // guarantees that _fileProvider is not null on exit

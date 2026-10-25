@@ -68,8 +68,13 @@ public sealed class FileServiceFixture
             ILogger<FileService> logger = loggerFactory.CreateLogger<FileService>();
             IOptions<FileServiceOptions> options = Options.Create(settings.FileProvider);
 
-            _fileService = new FileService(logger, options);
+            ILogger<ExportIndex> indexLogger = loggerFactory.CreateLogger<ExportIndex>();
+            string cacheDir = Path.Combine(settings.FileProvider.OutputDirectory, "cache");
+            ExportIndex exportIndex = new(indexLogger, cacheDir);
+
+            _fileService = new FileService(logger, options, exportIndex);
             await _fileService.InitializeAsync();
+            await exportIndex.InitializeAsync(_fileService.Provider);
 
             _initialized = true;
         }

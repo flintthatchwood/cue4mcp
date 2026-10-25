@@ -69,4 +69,20 @@ public class SearchExportsTests
         Assert.IsNotEmpty(result, "Should export at least one package");
         Assert.IsTrue(result.All(File.Exists), "All exported files should exist on disk");
     }
+
+    [TestMethod]
+    public void SearchExports_ByPropertyKey_UsesIndex()
+    {
+        // searchType=Property triggers the property-key index pre-filter,
+        // narrowing the scan from all packages down to those that actually
+        // declare a DinoNameTag property.
+        List<SearchResult> results = FileService.SearchExports(
+            keyPattern: "^DinoNameTag$",
+            searchType: ExportSearchType.Property).ToList();
+
+        Assert.IsNotEmpty(results, "Should find exports with DinoNameTag property");
+        Assert.IsTrue(
+            results.All(r => r.MatchedName.Equals("DinoNameTag", StringComparison.OrdinalIgnoreCase)),
+            "All matches should be DinoNameTag");
+    }
 }

@@ -1,304 +1,546 @@
-using System.IO.Compression;
+using System.Diagnostics;
 using System.Security.Cryptography;
-using System.Text.Json;
 
 using CUE4Parse.FileProvider;
 using CUE4Parse.FileProvider.Objects;
 using CUE4Parse.UE4.Assets;
 using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Assets.Objects;
 
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 
 namespace CUE4Mcp.Domain;
 
 /// <summary>
-/// Bidirectional in-memory index of export metadata (Class, Super, Outer, Template).
-/// Cached to disk with hash-based validation against pak files.
+/// SQLite-backed bidirectional index of export metadata (Class, Super, Outer, Template)
+/// plus property keys/types. Storage is a single .db file in the cache directory; rebuilt
+/// from pak files when the pak hash mismatches the stored hash.
+///
+/// Schema: interned <c>strings</c> table + <c>packages</c> + <c>exports</c> (FK ids for
+/// name/class/super/outer/template) + <c>properties</c> (export_id + key_id + type_id).
 /// </summary>
-public class ExportIndex
+public sealed class ExportIndex : IExportIndex, IDisposable
 {
     private readonly ILogger<ExportIndex> _logger;
     private readonly string _cacheDirectory;
+    private readonly string _dbPath;
 
-    // Forward index: (packagePath, exportIndex) -> ExportEntry
-    private readonly Dictionary<string, ExportEntry[]> _forward = new(StringComparer.OrdinalIgnoreCase);
+    private SqliteConnection? _conn;
 
-    // Reverse indices: field value -> list of (packagePath, exportIndex)
-    private readonly Dictionary<string, List<ExportRef>> _byClass = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, List<ExportRef>> _bySuper = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, List<ExportRef>> _byOuter = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, List<ExportRef>> _byTemplate = new(StringComparer.OrdinalIgnoreCase);
+    // Loaded once at init from packages table; small enough (~1.3 MB at full game)
+    private string[] _packagePaths = [];
+    private Dictionary<string, long> _packageIdByPath = new(StringComparer.OrdinalIgnoreCase);
+    private string[] _packagePathById = []; // index = id - 1 (packages.id is 1-based contiguous)
 
-    public int PackageCount => _forward.Count;
-    public int ExportCount => _forward.Values.Sum(e => e.Length);
+    private int _exportCount;
+    private int _propertyCount;
+
+    // Lazy prepared statements for hot lookups
+    private SqliteCommand? _stmtFindByClass;
+    private SqliteCommand? _stmtFindBySuper;
+    private SqliteCommand? _stmtFindByOuter;
+    private SqliteCommand? _stmtFindByTemplate;
+    private SqliteCommand? _stmtFindByPropKey;
+    private SqliteCommand? _stmtGetPackageExports;
+    private SqliteParameter? _findByClassParam;
+    private SqliteParameter? _findBySuperParam;
+    private SqliteParameter? _findByOuterParam;
+    private SqliteParameter? _findByTemplateParam;
+    private SqliteParameter? _findByPropKeyParam;
+    private SqliteParameter? _getPackageExportsParam;
+
+    public int PackageCount => _packagePaths.Length;
+    public int ExportCount => _exportCount;
+    public int PropertyCount => _propertyCount;
+    public IReadOnlyCollection<string> PackagePaths => _packagePaths;
 
     public ExportIndex(ILogger<ExportIndex> logger, string cacheDirectory)
     {
         _logger = logger;
         _cacheDirectory = cacheDirectory;
+        _dbPath = Path.Combine(cacheDirectory, "export-index.db");
     }
 
     /// <summary>
-    /// Loads index from cache if valid, otherwise builds from provider and saves to cache.
+    /// Loads the index from <c>export-index.db</c> if its stored hash matches the pak files,
+    /// otherwise rebuilds from the provider.
     /// </summary>
     public async Task InitializeAsync(DefaultFileProvider provider)
     {
-        string hash = ComputePakHash(provider);
-        string cachePath = Path.Combine(_cacheDirectory, "export-index.json.gz");
-        string hashPath = Path.Combine(_cacheDirectory, "export-index.hash");
+        await Task.Yield();
 
-        if (File.Exists(cachePath) && File.Exists(hashPath))
+        string expectedHash = ComputePakHash(provider);
+        Directory.CreateDirectory(_cacheDirectory);
+
+        // Best-effort cleanup of legacy json.gz cache from before SQLite
+        DeleteIfExists(Path.Combine(_cacheDirectory, "export-index.json.gz"));
+        DeleteIfExists(Path.Combine(_cacheDirectory, "export-index.hash"));
+
+        bool needRebuild = true;
+        if (File.Exists(_dbPath))
         {
-            string cachedHash = await File.ReadAllTextAsync(hashPath);
-            if (cachedHash == hash)
+            try
             {
-                _logger.LogInformation("Loading export index from cache");
-                await LoadFromCacheAsync(cachePath);
-                _logger.LogInformation("Loaded index: {Packages} packages, {Exports} exports", PackageCount, ExportCount);
-                return;
+                string? cachedHash = TryReadStoredHash(_dbPath);
+                if (cachedHash == expectedHash)
+                {
+                    _logger.LogInformation("Loading export index from cache: {Path}", _dbPath);
+                    needRebuild = false;
+                }
+                else
+                {
+                    _logger.LogInformation("Pak hash mismatch, rebuilding index");
+                }
             }
-
-            _logger.LogInformation("Pak hash mismatch, rebuilding index");
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to read cached index, rebuilding");
+            }
         }
 
-        Build(provider);
+        if (needRebuild)
+        {
+            Build(provider, expectedHash);
+        }
 
-        Directory.CreateDirectory(_cacheDirectory);
-        await SaveToCacheAsync(cachePath);
-        await File.WriteAllTextAsync(hashPath, hash);
-        _logger.LogInformation("Built and cached index: {Packages} packages, {Exports} exports", PackageCount, ExportCount);
+        OpenReadOnly();
+        LoadPackageList();
+
+        _logger.LogInformation("Index ready: {Packages} packages, {Exports} exports",
+            PackageCount, ExportCount);
     }
 
-    /// <summary>
-    /// Gets all export entries for a package.
-    /// </summary>
     public ExportEntry[]? GetPackageExports(string packagePath)
     {
-        return _forward.TryGetValue(packagePath, out ExportEntry[]? entries) ? entries : null;
+        if (_conn == null) throw new InvalidOperationException("Index not initialized");
+        if (!_packageIdByPath.TryGetValue(packagePath, out long pkgId)) return null;
+
+        if (_stmtGetPackageExports == null)
+        {
+            _stmtGetPackageExports = _conn.CreateCommand();
+            _stmtGetPackageExports.CommandText = """
+                SELECT e.export_index,
+                       sn.text, sc.text, ss.text, so.text, st.text
+                FROM exports e
+                LEFT JOIN strings sn ON sn.id = e.name_id
+                LEFT JOIN strings sc ON sc.id = e.class_id
+                LEFT JOIN strings ss ON ss.id = e.super_id
+                LEFT JOIN strings so ON so.id = e.outer_id
+                LEFT JOIN strings st ON st.id = e.template_id
+                WHERE e.package_id = $pid
+                ORDER BY e.export_index
+                """;
+            _getPackageExportsParam = _stmtGetPackageExports.CreateParameter();
+            _getPackageExportsParam.ParameterName = "$pid";
+            _stmtGetPackageExports.Parameters.Add(_getPackageExportsParam);
+            _stmtGetPackageExports.Prepare();
+        }
+
+        _getPackageExportsParam!.Value = pkgId;
+        List<ExportEntry> entries = [];
+        using SqliteDataReader rdr = _stmtGetPackageExports.ExecuteReader();
+        int expectedIndex = 0;
+        while (rdr.Read())
+        {
+            int idx = rdr.GetInt32(0);
+            // Pad with empty entries for any gaps (shouldn't happen, but defensive)
+            while (entries.Count < idx) entries.Add(new ExportEntry(null, null, null, null, null));
+            entries.Add(new ExportEntry(
+                rdr.IsDBNull(1) ? null : rdr.GetString(1),
+                rdr.IsDBNull(2) ? null : rdr.GetString(2),
+                rdr.IsDBNull(3) ? null : rdr.GetString(3),
+                rdr.IsDBNull(4) ? null : rdr.GetString(4),
+                rdr.IsDBNull(5) ? null : rdr.GetString(5)));
+            expectedIndex = idx + 1;
+        }
+        _ = expectedIndex;
+        return entries.ToArray();
     }
 
-    /// <summary>
-    /// Finds all exports with a given class name.
-    /// </summary>
     public IReadOnlyList<ExportRef> FindByClass(string className)
-    {
-        return _byClass.TryGetValue(className, out List<ExportRef>? refs) ? refs : [];
-    }
+        => FindBy(ref _stmtFindByClass, ref _findByClassParam, "class_id", className);
 
-    /// <summary>
-    /// Finds all exports with a given super name.
-    /// </summary>
     public IReadOnlyList<ExportRef> FindBySuper(string superName)
-    {
-        return _bySuper.TryGetValue(superName, out List<ExportRef>? refs) ? refs : [];
-    }
+        => FindBy(ref _stmtFindBySuper, ref _findBySuperParam, "super_id", superName);
 
-    /// <summary>
-    /// Finds all exports with a given outer name.
-    /// </summary>
     public IReadOnlyList<ExportRef> FindByOuter(string outerName)
-    {
-        return _byOuter.TryGetValue(outerName, out List<ExportRef>? refs) ? refs : [];
-    }
+        => FindBy(ref _stmtFindByOuter, ref _findByOuterParam, "outer_id", outerName);
 
-    /// <summary>
-    /// Finds all exports with a given template name.
-    /// </summary>
     public IReadOnlyList<ExportRef> FindByTemplate(string templateName)
+        => FindBy(ref _stmtFindByTemplate, ref _findByTemplateParam, "template_id", templateName);
+
+    public IReadOnlyList<ExportRef> FindByPropertyKey(string propertyKey)
     {
-        return _byTemplate.TryGetValue(templateName, out List<ExportRef>? refs) ? refs : [];
+        if (_conn == null) throw new InvalidOperationException("Index not initialized");
+
+        if (_stmtFindByPropKey == null)
+        {
+            _stmtFindByPropKey = _conn.CreateCommand();
+            _stmtFindByPropKey.CommandText = """
+                SELECT e.package_id, e.export_index
+                FROM properties p
+                JOIN exports e ON e.id = p.export_id
+                WHERE p.key_id = (SELECT id FROM strings WHERE text = $t)
+                """;
+            _findByPropKeyParam = _stmtFindByPropKey.CreateParameter();
+            _findByPropKeyParam.ParameterName = "$t";
+            _stmtFindByPropKey.Parameters.Add(_findByPropKeyParam);
+            _stmtFindByPropKey.Prepare();
+        }
+
+        _findByPropKeyParam!.Value = propertyKey;
+        List<ExportRef> result = [];
+        using SqliteDataReader rdr = _stmtFindByPropKey.ExecuteReader();
+        while (rdr.Read())
+        {
+            long pkgId = rdr.GetInt64(0);
+            int exportIndex = rdr.GetInt32(1);
+            if (pkgId > 0 && pkgId < _packagePathById.Length)
+                result.Add(new ExportRef(_packagePathById[(int)pkgId], exportIndex));
+        }
+        return result;
     }
 
-    /// <summary>
-    /// Gets all distinct class names in the index.
-    /// </summary>
-    public IReadOnlyCollection<string> GetClassNames() => _byClass.Keys;
+    public IReadOnlyCollection<string> GetClassNames()    => GetDistinctStringsForColumn("class_id");
+    public IReadOnlyCollection<string> GetSuperNames()    => GetDistinctStringsForColumn("super_id");
+    public IReadOnlyCollection<string> GetOuterNames()    => GetDistinctStringsForColumn("outer_id");
+    public IReadOnlyCollection<string> GetTemplateNames() => GetDistinctStringsForColumn("template_id");
 
-    /// <summary>
-    /// Gets all distinct super names in the index.
-    /// </summary>
-    public IReadOnlyCollection<string> GetSuperNames() => _bySuper.Keys;
-
-    /// <summary>
-    /// Gets all distinct outer names in the index.
-    /// </summary>
-    public IReadOnlyCollection<string> GetOuterNames() => _byOuter.Keys;
-
-    /// <summary>
-    /// Gets all distinct template names in the index.
-    /// </summary>
-    public IReadOnlyCollection<string> GetTemplateNames() => _byTemplate.Keys;
-
-    private void Build(DefaultFileProvider provider)
+    public IReadOnlyCollection<string> GetPropertyKeys()
     {
-        _forward.Clear();
-        _byClass.Clear();
-        _bySuper.Clear();
-        _byOuter.Clear();
-        _byTemplate.Clear();
+        if (_conn == null) throw new InvalidOperationException("Index not initialized");
+
+        using SqliteCommand cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT s.text
+            FROM strings s
+            WHERE s.id IN (SELECT DISTINCT key_id FROM properties)
+            """;
+        List<string> result = [];
+        using SqliteDataReader rdr = cmd.ExecuteReader();
+        while (rdr.Read()) result.Add(rdr.GetString(0));
+        return result;
+    }
+
+    public void Dispose()
+    {
+        _stmtFindByClass?.Dispose();
+        _stmtFindBySuper?.Dispose();
+        _stmtFindByOuter?.Dispose();
+        _stmtFindByTemplate?.Dispose();
+        _stmtFindByPropKey?.Dispose();
+        _stmtGetPackageExports?.Dispose();
+        _conn?.Dispose();
+        _conn = null;
+    }
+
+    // ─────────────────────────────────────────────────────────────── build
+
+    private void Build(DefaultFileProvider provider, string expectedHash)
+    {
+        if (File.Exists(_dbPath)) File.Delete(_dbPath);
+
+        Stopwatch swTotal = Stopwatch.StartNew();
 
         string[] packageFiles = provider.Files.Keys
             .Where(IsPackageFile)
             .ToArray();
 
-        _logger.LogInformation("Building export index for {Count} package files", packageFiles.Length);
+        _logger.LogInformation("Building export index for {Count} package files -> {Path}",
+            packageFiles.Length, _dbPath);
 
-        int processed = 0;
-        int errors = 0;
+        using SqliteConnection conn = new($"Data Source={_dbPath}");
+        conn.Open();
+
+        ExecNonQuery(conn, """
+            PRAGMA journal_mode = MEMORY;
+            PRAGMA synchronous = OFF;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -200000;
+        """);
+        ExecNonQuery(conn, Schema);
+
+        using SqliteTransaction tx = conn.BeginTransaction();
+
+        // In-memory string pool — flushed to the strings table at commit.
+        // OrdinalIgnoreCase matches the previous Dictionary<string, List<ExportRef>> semantics.
+        Dictionary<string, long> stringIds = new(StringComparer.OrdinalIgnoreCase);
+        long nextStringId = 1;
+
+        long InternString(string? s)
+        {
+            if (s == null) return 0; // 0 == NULL sentinel; stored as NULL FK
+            if (stringIds.TryGetValue(s, out long id)) return id;
+            id = nextStringId++;
+            stringIds[s] = id;
+            return id;
+        }
+
+        SqliteCommand insertPkg = conn.CreateCommand();
+        insertPkg.Transaction = tx;
+        insertPkg.CommandText = "INSERT INTO packages(path) VALUES($p); SELECT last_insert_rowid();";
+        SqliteParameter p_pkgPath = AddParam(insertPkg, "$p");
+
+        SqliteCommand insertExp = conn.CreateCommand();
+        insertExp.Transaction = tx;
+        insertExp.CommandText = """
+            INSERT INTO exports(package_id, export_index, name_id, class_id, super_id, outer_id, template_id)
+            VALUES($pid, $idx, $n, $c, $s, $o, $t);
+            SELECT last_insert_rowid();
+        """;
+        SqliteParameter p_expPid = AddParam(insertExp, "$pid");
+        SqliteParameter p_expIdx = AddParam(insertExp, "$idx");
+        SqliteParameter p_expN = AddParam(insertExp, "$n");
+        SqliteParameter p_expC = AddParam(insertExp, "$c");
+        SqliteParameter p_expS = AddParam(insertExp, "$s");
+        SqliteParameter p_expO = AddParam(insertExp, "$o");
+        SqliteParameter p_expT = AddParam(insertExp, "$t");
+
+        SqliteCommand insertProp = conn.CreateCommand();
+        insertProp.Transaction = tx;
+        insertProp.CommandText = "INSERT OR IGNORE INTO properties(export_id, key_id, type_id) VALUES($eid, $k, $t);";
+        SqliteParameter p_propEid = AddParam(insertProp, "$eid");
+        SqliteParameter p_propK = AddParam(insertProp, "$k");
+        SqliteParameter p_propT = AddParam(insertProp, "$t");
+
+        static object IdOrNull(long id) => id == 0 ? DBNull.Value : id;
+
+        int processed = 0, errors = 0, exportCount = 0;
+        Stopwatch swWalk = Stopwatch.StartNew();
 
         foreach (string filePath in packageFiles)
         {
+            processed++;
             try
             {
                 IPackage package = provider.LoadPackage(filePath);
                 if (package == null) continue;
 
-                Lazy<UObject>[] exports = package.ExportsLazy;
-                ExportEntry[] entries = new ExportEntry[exports.Length];
+                p_pkgPath.Value = package.Name;
+                long pkgId = (long)insertPkg.ExecuteScalar()!;
 
-                for (int i = 0; i < exports.Length; i++)
+                Lazy<UObject>[] lazyExports = package.ExportsLazy;
+                for (int i = 0; i < lazyExports.Length; i++)
                 {
+                    UObject export;
+                    string? name, className, superName, outerName, templateName;
                     try
                     {
-                        UObject export = exports[i].Value;
-                        string? className = export.Class?.Name;
-                        string? superName = export.Super?.Name.ToString();
-                        string? outerName = export.Outer?.Name;
-                        string? templateName = export.Template?.Name.ToString();
-                        string exportName = export.Name;
-
-                        entries[i] = new ExportEntry(exportName, className, superName, outerName, templateName);
-
-                        ExportRef exportRef = new(package.Name, i);
-
-                        if (className != null)
-                            AddToReverse(_byClass, className, exportRef);
-                        if (superName != null)
-                            AddToReverse(_bySuper, superName, exportRef);
-                        if (outerName != null)
-                            AddToReverse(_byOuter, outerName, exportRef);
-                        if (templateName != null)
-                            AddToReverse(_byTemplate, templateName, exportRef);
+                        export = lazyExports[i].Value;
+                        name = export.Name;
+                        className = export.Class?.Name;
+                        superName = export.Super?.Name.ToString();
+                        outerName = export.Outer?.Name;
+                        templateName = export.Template?.Name.ToString();
                     }
                     catch
                     {
-                        entries[i] = new ExportEntry(null, null, null, null, null);
                         errors++;
+                        // Insert a null-filled placeholder so export_index stays aligned
+                        p_expPid.Value = pkgId;
+                        p_expIdx.Value = i;
+                        p_expN.Value = p_expC.Value = p_expS.Value = p_expO.Value = p_expT.Value = DBNull.Value;
+                        insertExp.ExecuteScalar();
+                        exportCount++;
+                        continue;
+                    }
+
+                    p_expPid.Value = pkgId;
+                    p_expIdx.Value = i;
+                    p_expN.Value = IdOrNull(InternString(name));
+                    p_expC.Value = IdOrNull(InternString(className));
+                    p_expS.Value = IdOrNull(InternString(superName));
+                    p_expO.Value = IdOrNull(InternString(outerName));
+                    p_expT.Value = IdOrNull(InternString(templateName));
+                    long expId = (long)insertExp.ExecuteScalar()!;
+                    exportCount++;
+
+                    foreach (FPropertyTag tag in export.Properties)
+                    {
+                        string key = tag.Name.Text;
+                        string type = tag.PropertyType.Text;
+
+                        p_propEid.Value = expId;
+                        p_propK.Value = InternString(key);
+                        p_propT.Value = InternString(type);
+                        insertProp.ExecuteNonQuery();
                     }
                 }
-
-                _forward[package.Name] = entries;
-                processed++;
-
-                if (processed % 10000 == 0)
-                    _logger.LogInformation("Indexed {Processed}/{Total} packages ({Errors} errors)", processed, packageFiles.Length, errors);
             }
             catch
             {
                 errors++;
             }
-        }
 
-        _logger.LogInformation("Index build complete: {Processed} packages, {Errors} errors", processed, errors);
-    }
-
-    private static void AddToReverse(Dictionary<string, List<ExportRef>> index, string key, ExportRef exportRef)
-    {
-        if (!index.TryGetValue(key, out List<ExportRef>? list))
-        {
-            list = [];
-            index[key] = list;
-        }
-
-        list.Add(exportRef);
-    }
-
-    private async Task SaveToCacheAsync(string path)
-    {
-        // Build string table: assign an index to each unique string
-        Dictionary<string, int> stringToId = new(StringComparer.Ordinal);
-        List<string> strings = [];
-
-        int Intern(string? s)
-        {
-            if (s == null) return -1;
-            if (stringToId.TryGetValue(s, out int id)) return id;
-            id = strings.Count;
-            strings.Add(s);
-            stringToId[s] = id;
-            return id;
-        }
-
-        // Convert forward index to compact form
-        List<CachePackage> packages = new(_forward.Count);
-        foreach (KeyValuePair<string, ExportEntry[]> kvp in _forward)
-        {
-            int nameId = Intern(kvp.Key);
-            int[][] exports = new int[kvp.Value.Length][];
-            for (int i = 0; i < kvp.Value.Length; i++)
+            if (processed % 5000 == 0)
             {
-                ExportEntry e = kvp.Value[i];
-                exports[i] = [Intern(e.Name), Intern(e.Class), Intern(e.Super), Intern(e.Outer), Intern(e.Template)];
+                _logger.LogInformation("Indexed {Processed}/{Total} packages ({Errors} errors, {Exports} exports, {Strings} strings)",
+                    processed, packageFiles.Length, errors, exportCount, stringIds.Count);
             }
-
-            packages.Add(new CachePackage { Name = nameId, Exports = exports });
         }
+        swWalk.Stop();
 
-        CacheData data = new() { Strings = [.. strings], Packages = [.. packages] };
+        // Flush the string pool. Insert in id order so packages.id (which arrives from auto-increment)
+        // and strings.id are both contiguous starting at 1.
+        _logger.LogInformation("Flushing {Count} interned strings", stringIds.Count);
+        SqliteCommand insertStr = conn.CreateCommand();
+        insertStr.Transaction = tx;
+        insertStr.CommandText = "INSERT INTO strings(id, text) VALUES($i, $t);";
+        SqliteParameter p_strId = AddParam(insertStr, "$i");
+        SqliteParameter p_strText = AddParam(insertStr, "$t");
 
-        await using FileStream fileStream = File.Create(path);
-        await using GZipStream gzip = new(fileStream, CompressionLevel.Optimal);
-        await JsonSerializer.SerializeAsync(gzip, data);
-    }
-
-    private async Task LoadFromCacheAsync(string path)
-    {
-        _forward.Clear();
-        _byClass.Clear();
-        _bySuper.Clear();
-        _byOuter.Clear();
-        _byTemplate.Clear();
-
-        await using FileStream fileStream = File.OpenRead(path);
-        await using GZipStream gzip = new(fileStream, CompressionMode.Decompress);
-        CacheData? data = await JsonSerializer.DeserializeAsync<CacheData>(gzip);
-
-        if (data?.Packages == null || data.Strings == null)
-            return;
-
-        string[] strings = data.Strings;
-
-        string? Resolve(int id) => id < 0 ? null : strings[id];
-
-        foreach (CachePackage pkg in data.Packages)
+        foreach (KeyValuePair<string, long> kvp in stringIds.OrderBy(k => k.Value))
         {
-            string packageName = strings[pkg.Name];
-            ExportEntry[] entries = new ExportEntry[pkg.Exports.Length];
+            p_strId.Value = kvp.Value;
+            p_strText.Value = kvp.Key;
+            insertStr.ExecuteNonQuery();
+        }
 
-            for (int i = 0; i < pkg.Exports.Length; i++)
+        // Persist the validation hash inside the DB.
+        ExecNonQuery(conn, $"INSERT INTO meta(key, value) VALUES('pak_hash', '{expectedHash}');", tx);
+
+        Stopwatch swCommit = Stopwatch.StartNew();
+        tx.Commit();
+        swCommit.Stop();
+
+        _logger.LogInformation("Building indices...");
+        Stopwatch swIndex = Stopwatch.StartNew();
+        ExecNonQuery(conn, Indices);
+        ExecNonQuery(conn, "ANALYZE;");
+        swIndex.Stop();
+
+        conn.Close();
+        SqliteConnection.ClearAllPools();
+
+        swTotal.Stop();
+        long dbBytes = new FileInfo(_dbPath).Length;
+        _logger.LogInformation(
+            "Index build complete: {Exports} exports, {Errors} errors, {Strings} strings, " +
+            "{Size:F1} MiB, walk {Walk:F1}s, commit {Commit:F1}s, index {Idx:F1}s, total {Total:F1}s",
+            exportCount, errors, stringIds.Count,
+            dbBytes / (1024.0 * 1024.0),
+            swWalk.Elapsed.TotalSeconds, swCommit.Elapsed.TotalSeconds,
+            swIndex.Elapsed.TotalSeconds, swTotal.Elapsed.TotalSeconds);
+    }
+
+    // ─────────────────────────────────────────────────────────── open / load
+
+    private void OpenReadOnly()
+    {
+        _conn = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly");
+        _conn.Open();
+        ExecNonQuery(_conn, """
+            PRAGMA query_only = ON;
+            PRAGMA cache_size = -200000;
+            PRAGMA temp_store = MEMORY;
+        """);
+    }
+
+    private void LoadPackageList()
+    {
+        if (_conn == null) throw new InvalidOperationException();
+
+        // Stream packages in id order so we can build a flat id→path array (1-based ids).
+        List<string> paths = [];
+        Dictionary<string, long> idByPath = new(StringComparer.OrdinalIgnoreCase);
+        List<string> pathById = [string.Empty]; // index 0 unused (ids start at 1)
+
+        using (SqliteCommand cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT id, path FROM packages ORDER BY id";
+            using SqliteDataReader rdr = cmd.ExecuteReader();
+            while (rdr.Read())
             {
-                int[] e = pkg.Exports[i];
-                entries[i] = new ExportEntry(Resolve(e[0]), Resolve(e[1]), Resolve(e[2]), Resolve(e[3]), Resolve(e[4]));
-
-                ExportRef exportRef = new(packageName, i);
-
-                if (entries[i].Class != null)
-                    AddToReverse(_byClass, entries[i].Class!, exportRef);
-                if (entries[i].Super != null)
-                    AddToReverse(_bySuper, entries[i].Super!, exportRef);
-                if (entries[i].Outer != null)
-                    AddToReverse(_byOuter, entries[i].Outer!, exportRef);
-                if (entries[i].Template != null)
-                    AddToReverse(_byTemplate, entries[i].Template!, exportRef);
+                long id = rdr.GetInt64(0);
+                string path = rdr.GetString(1);
+                paths.Add(path);
+                idByPath[path] = id;
+                while (pathById.Count <= id) pathById.Add(string.Empty);
+                pathById[(int)id] = path;
             }
+        }
 
-            _forward[packageName] = entries;
+        _packagePaths = paths.ToArray();
+        _packageIdByPath = idByPath;
+        _packagePathById = pathById.ToArray();
+
+        using (SqliteCommand cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM exports";
+            _exportCount = (int)(long)cmd.ExecuteScalar()!;
+        }
+
+        using (SqliteCommand cmd = _conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM properties";
+            _propertyCount = (int)(long)cmd.ExecuteScalar()!;
         }
     }
+
+    private string? TryReadStoredHash(string dbPath)
+    {
+        using SqliteConnection conn = new($"Data Source={dbPath};Mode=ReadOnly");
+        conn.Open();
+        using SqliteCommand cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT value FROM meta WHERE key = 'pak_hash'";
+        return cmd.ExecuteScalar() as string;
+    }
+
+    // ─────────────────────────────────────────────────────────── query helpers
+
+    private IReadOnlyList<ExportRef> FindBy(
+        ref SqliteCommand? stmt, ref SqliteParameter? param, string columnId, string text)
+    {
+        if (_conn == null) throw new InvalidOperationException("Index not initialized");
+
+        if (stmt == null)
+        {
+            stmt = _conn.CreateCommand();
+            stmt.CommandText = $"""
+                SELECT e.package_id, e.export_index
+                FROM exports e
+                WHERE e.{columnId} = (SELECT id FROM strings WHERE text = $t)
+                """;
+            param = stmt.CreateParameter();
+            param.ParameterName = "$t";
+            stmt.Parameters.Add(param);
+            stmt.Prepare();
+        }
+
+        param!.Value = text;
+        List<ExportRef> result = [];
+        using SqliteDataReader rdr = stmt.ExecuteReader();
+        while (rdr.Read())
+        {
+            long pkgId = rdr.GetInt64(0);
+            int exportIndex = rdr.GetInt32(1);
+            if (pkgId > 0 && pkgId < _packagePathById.Length)
+                result.Add(new ExportRef(_packagePathById[(int)pkgId], exportIndex));
+        }
+        return result;
+    }
+
+    private IReadOnlyCollection<string> GetDistinctStringsForColumn(string columnId)
+    {
+        if (_conn == null) throw new InvalidOperationException("Index not initialized");
+
+        using SqliteCommand cmd = _conn.CreateCommand();
+        cmd.CommandText = $"""
+            SELECT s.text
+            FROM strings s
+            WHERE s.id IN (SELECT DISTINCT {columnId} FROM exports WHERE {columnId} IS NOT NULL)
+            """;
+        List<string> result = [];
+        using SqliteDataReader rdr = cmd.ExecuteReader();
+        while (rdr.Read()) result.Add(rdr.GetString(0));
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────── infrastructure
 
     private static string ComputePakHash(DefaultFileProvider provider)
     {
-        // Build a hash from pak file names and sizes to detect changes
         IOrderedEnumerable<string> pakFiles = provider.MountedVfs
             .Select(vfs => $"{vfs.Name}:{vfs.Length}")
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase);
@@ -315,23 +557,73 @@ public class ExportIndex
             if (filePath.EndsWith($".{extension}", StringComparison.OrdinalIgnoreCase))
                 return true;
         }
-
         return false;
     }
 
-    // Cache serialization types (string table + int references)
-    private class CacheData
+    private static void ExecNonQuery(SqliteConnection conn, string sql, SqliteTransaction? tx = null)
     {
-        public string[] Strings { get; set; } = [];
-        public CachePackage[] Packages { get; set; } = [];
+        using SqliteCommand cmd = conn.CreateCommand();
+        if (tx != null) cmd.Transaction = tx;
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
     }
 
-    private class CachePackage
+    private static SqliteParameter AddParam(SqliteCommand cmd, string name)
     {
-        public int Name { get; set; }
-        public int[][] Exports { get; set; } = []; // Each export: [name, class, super, outer, template] as string table indices
+        SqliteParameter p = cmd.CreateParameter();
+        p.ParameterName = name;
+        cmd.Parameters.Add(p);
+        return p;
     }
+
+    private static void DeleteIfExists(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch { /* best effort */ }
+    }
+
+    private const string Schema = """
+        CREATE TABLE meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE strings (
+            id   INTEGER PRIMARY KEY,
+            text TEXT NOT NULL UNIQUE COLLATE NOCASE
+        );
+        CREATE TABLE packages (
+            id   INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE exports (
+            id           INTEGER PRIMARY KEY,
+            package_id   INTEGER NOT NULL,
+            export_index INTEGER NOT NULL,
+            name_id      INTEGER,
+            class_id     INTEGER,
+            super_id     INTEGER,
+            outer_id     INTEGER,
+            template_id  INTEGER
+        );
+        CREATE TABLE properties (
+            export_id INTEGER NOT NULL,
+            key_id    INTEGER NOT NULL,
+            type_id   INTEGER NOT NULL,
+            PRIMARY KEY (export_id, key_id)
+        ) WITHOUT ROWID;
+    """;
+
+    private const string Indices = """
+        CREATE INDEX idx_exports_pkg         ON exports(package_id);
+        CREATE INDEX idx_exports_class_id    ON exports(class_id);
+        CREATE INDEX idx_exports_super_id    ON exports(super_id);
+        CREATE INDEX idx_exports_outer_id    ON exports(outer_id);
+        CREATE INDEX idx_exports_template_id ON exports(template_id);
+        CREATE INDEX idx_exports_name_id     ON exports(name_id);
+        CREATE INDEX idx_properties_key_id   ON properties(key_id);
+    """;
 }
 
 public record struct ExportEntry(string? Name, string? Class, string? Super, string? Outer, string? Template);
 public record struct ExportRef(string PackagePath, int ExportIndex);
+

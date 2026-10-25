@@ -10,9 +10,9 @@ namespace CUE4Mcp.Tools;
 [McpServerToolType]
 public class IndexSearchTool
 {
-    private readonly ExportIndex _index;
+    private readonly IExportIndex _index;
 
-    public IndexSearchTool(ExportIndex index)
+    public IndexSearchTool(IExportIndex index)
     {
         _index = index;
     }
@@ -87,18 +87,40 @@ public class IndexSearchTool
         return SearchReverse(pattern, limit, "template", _index.GetTemplateNames(), _index.FindByTemplate);
     }
 
+    [McpServerTool(Name = "cue4-find-by-property-key")]
+    [Description("Find all exports that declare a property with the given key (e.g., 'MinQuality', 'DinoNameTag'). Supports exact match or regex pattern. Backed by the property-key index — much faster than scanning all packages.")]
+    public object FindByPropertyKey(
+        [Description("Property key name or regex pattern")]
+        string pattern,
+        [Description("Maximum number of results to return (default 100)")]
+        int limit = 100)
+    {
+        return SearchReverse(pattern, limit, "propertyKey", _index.GetPropertyKeys(), _index.FindByPropertyKey);
+    }
+
+    [McpServerTool(Name = "cue4-list-property-keys")]
+    [Description("List all distinct property keys in the index, with optional regex filter. Each entry includes how many exports declare the key.")]
+    public object ListPropertyKeys(
+        [Description("Optional regex pattern to filter property keys")]
+        string? pattern = null)
+    {
+        return FilterNames(_index.GetPropertyKeys(), pattern, _index.FindByPropertyKey);
+    }
+
     [McpServerTool(Name = "cue4-index-stats")]
-    [Description("Get statistics about the export index: total packages, exports, and unique values per field.")]
+    [Description("Get statistics about the export index: total packages, exports, properties, and unique values per field.")]
     public object IndexStats()
     {
         return new
         {
             packages = _index.PackageCount,
             exports = _index.ExportCount,
+            properties = _index.PropertyCount,
             uniqueClasses = _index.GetClassNames().Count,
             uniqueSupers = _index.GetSuperNames().Count,
             uniqueOuters = _index.GetOuterNames().Count,
             uniqueTemplates = _index.GetTemplateNames().Count,
+            uniquePropertyKeys = _index.GetPropertyKeys().Count,
         };
     }
 
